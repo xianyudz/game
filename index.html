@@ -103,6 +103,24 @@
   .howto { font-size: 12.5px; color: #93a0b2; line-height: 1.85; margin-top: 14px; text-align: left; }
   .howto b { color: #66748c; }
 
+  /* ---------- 加载进度 ---------- */
+  .loadbar {
+    height: 10px; border-radius: 6px; overflow: hidden;
+    background: #eef3fa; margin: 18px 6px 8px;
+  }
+  .loadbar > i {
+    display: block; height: 100%; width: 0%;
+    border-radius: 6px; transition: width .25s ease;
+    background: linear-gradient(135deg, #ff7a95, #ff9f68);
+  }
+  .loadnum { font-size: 13px; color: #93a0b2; letter-spacing: 1px; }
+  .loadwarn {
+    margin-top: 16px; padding: 12px 14px; border-radius: 12px;
+    background: #fff8ec; color: #8a6a33; font-size: 13px; line-height: 1.7;
+    text-align: left;
+  }
+  .loadwarn .btn { margin-top: 10px; font-size: 14px; padding: 10px 14px; }
+
   /* ---------- 底部 ---------- */
   .bottom { flex: 0 0 auto; display: flex; flex-direction: column; gap: 7px; }
   .toolbar { display: flex; gap: 8px; }
@@ -388,22 +406,93 @@
   // "单文件版"会把图片直接内嵌在网页里（data:...），这里优先用内嵌的那份。
   // 文件夹版没有这个变量，就按平常的路径去 images/ 里读，两边都能跑。
   var INLINE_IMAGES = window.__INLINE_IMAGES || null;
-  function imgSrcOf(p) {
-    return (INLINE_IMAGES && INLINE_IMAGES[p]) ? INLINE_IMAGES[p] : p;
+
+  /* 一张图可能有好几种格式，按顺序试：
+   *   1. 内嵌的 data:（单文件版）
+   *   2. WebP —— 比 PNG 小 5 倍多，加载快很多
+   *   3. PNG  —— 兜底，任何浏览器都认
+   * 这样既快，又不会因为浏览器不支持 WebP 而坏掉。 */
+  function candidatesOf(p) {
+    if (INLINE_IMAGES && INLINE_IMAGES[p]) return [INLINE_IMAGES[p]];
+    var list = [];
+    if (/\.png$/i.test(p)) {
+      var w = p.replace(/\.png$/i, '.webp');
+      list.push((INLINE_IMAGES && INLINE_IMAGES[w]) ? INLINE_IMAGES[w] : w);
+    }
+    list.push(p);
+    return list;
   }
 
-  var images = game.levels.map(function (L) {
+  var IMG_RETRY = 3;                       // 每种格式最多重试几次（防网络抖动）
+  var loadState = { total: 0, ok: 0, failed: 0, done: false };
+  var images = [];
+
+  function recountImages() {
+    var ok = 0, no = 0;
+    for (var i = 0; i < images.length; i++) {
+      if (images[i].__ok === true) ok++;
+      else if (images[i].__ok === false) no++;
+    }
+    loadState.ok = ok;
+    loadState.failed = no;
+    loadState.done = (ok + no) >= loadState.total;
+    refreshStaticUI();
+    updateLoadProgress();
+  }
+
+  function loadImageSmart(img, path) {
+    var cands = candidatesOf(path);
+    var ci = 0, tries = 0, settled = false;
+
+    function finish(ok) {
+      if (settled) return;
+      settled = true;
+      img.__ok = ok;
+      recountImages();
+    }
+
+    function attempt() {
+      if (ci >= cands.length) { finish(false); return; }
+      var url = cands[ci];
+      if (url.indexOf('data:') === 0) { img.src = url; return; }   // 内嵌的不用重试
+      img.src = tries > 0 ? url + (url.indexOf('?') >= 0 ? '&' : '?') + 'r=' + tries : url;
+    }
+
+    img.onload = function () { finish(true); };
+    img.onerror = function () {
+      var isLast = (ci >= cands.length - 1);
+      if (!isLast) { ci++; tries = 0; attempt(); return; }          // WebP 不行就立刻换 PNG
+      if (tries < IMG_RETRY) { tries++; setTimeout(attempt, 500 * tries); return; }
+      finish(false);
+    };
+
+    attempt();
+  }
+
+  loadState.total = game.levels.length;
+  images = game.levels.map(function (L) {
     var img = new Image();
     img.decoding = 'async';
-    img.onload = function () { img.__ok = true; refreshStaticUI(); };
-    img.onerror = function () { img.__ok = false; };
-    img.src = imgSrcOf(L.image);
+    loadImageSmart(img, L.image);
     return img;
   });
 
+  /** 页面重新可见 / 窗口重新获得焦点时，把没加载出来的图再试一次 */
+  function retryFailedImages() {
+    var n = 0;
+    for (var i = 0; i < images.length; i++) {
+      if (images[i].__ok === false) {
+        images[i].__ok = undefined;
+        loadImageSmart(images[i], game.levels[i].image);
+        n++;
+      }
+    }
+    return n;
+  }
+
   // 图片的宽高比（抠好的图一般是正方形，所以这个值通常是 1）
   function imgReady(img) {
-    return img && img.__ok && img.naturalWidth > 0;
+    return img && img.__ok === true && img.naturalWidth > 0;
   }
 
   /* =========================================================
@@ -901,7 +990,8 @@
       d.title = L.name + '（第 ' + (i + 1) + ' 级）';
       var img = document.createElement('img');
       img.alt = L.name;
-      img.src = imgSrcOf(L.image);
+      // 直接用游戏已经加载好的那份，浏览器会命中缓存，不会重复下载
+      img.src = (images[i] && images[i].src) || candidatesOf(L.image)[0];
       img.onload = function () { if (img.naturalWidth) { img.style.display = 'block'; d.dataset.hasimg = '1'; } };
       img.onerror = function () { img.style.display = 'none'; };
       var span = document.createElement('span');
@@ -958,7 +1048,54 @@
    * ========================================================= */
   var overlay = $('overlay'), panel = $('panel');
 
+  /* ---- 加载中：先把人物图片拉下来，加载完再放人进去玩 ----
+   * 不然一开局是水果表情，等图下完了才变成照片，看着很怪。
+   * 网络慢的话这一步可能有一两秒，所以给个进度条让心里有数。 */
+  var loadShown = false;
+  var loadDeadline = 0;          // 万一有图一直下不来，也别卡死
+  var galleryRebuilt = false;
+
+  function showLoading(stage, text) {
+    loadShown = true;
+    var pct = loadState.total ? Math.round(loadState.ok / loadState.total * 100) : 0;
+    panel.innerHTML =
+      '<h2>🍉 合成大西瓜</h2>' +
+      '<div class="sub">' + (text || '正在加载人物图片') + '…</div>' +
+      '<div class="loadbar"><i style="width:' + pct + '%"></i></div>' +
+      '<div class="loadnum">' + loadState.ok + ' / ' + loadState.total + '</div>';
+    overlay.classList.add('show');
+  }
+
+  function updateLoadProgress() {
+    if (!loadShown) return;
+
+    if (!galleryRebuilt && loadState.done) {
+      galleryRebuilt = true;
+      buildGallery();          // 图下好了重建一遍图鉴，缩略图才是完整的
+    }
+
+    if (loadState.done) {
+      showStart();
+      return;
+    }
+    if (Date.now() > loadDeadline) {
+      // 等太久了，先让玩家进去（缺的图会显示备用样式，之后再自动补）
+      showStart();
+      return;
+    }
+    // 只更新进度数字和进度条，不整块重画（避免闪）
+    var bar = panel.querySelector('.loadbar > i');
+    var num = panel.querySelector('.loadnum');
+    if (bar && num) {
+      bar.style.width = Math.round(loadState.ok / loadState.total * 100) + '%';
+      num.textContent = loadState.ok + ' / ' + loadState.total;
+    } else {
+      showLoading();
+    }
+  }
+
   function showStart() {
+    if (overlay.querySelector('#btnStart')) return;   // 已经是开始界面了就别重画
     panel.innerHTML =
       '<h2>🍉 合成大西瓜</h2>' +
       '<div class="sub">用你的照片，合成最大的那个人</div>' +
@@ -969,7 +1106,11 @@
         '· 点击 / 按空格 放球<br>' +
         '· 两个<b>一样</b>的碰到一起 → 合成更大的<br>' +
         '· 堆过上面的红线就输了' +
-      '</div>';
+      '</div>' +
+      (loadState.failed > 0
+        ? '<div class="loadwarn">有 ' + loadState.failed + ' 张人物图没加载出来，' +
+          '会先用备用样式顶着。<button class="btn ghost" id="btnReloadImg">重新加载图片</button></div>'
+        : '');
     overlay.classList.add('show');
     $('btnStart').onclick = function () {
       Sfx.init(); Sfx.ui();
@@ -978,6 +1119,18 @@
       lastScore = lastBest = lastNext = lastGalleryKey = '';
       lastScore = -1;
     };
+    var rb = $('btnReloadImg');
+    if (rb) {
+      rb.onclick = function () {
+        rb.textContent = '正在重试…';
+        loadState.failed = 0;
+        retryFailedImages();
+        recountImages();
+        setTimeout(function () {
+          if (loadState.ok + loadState.failed >= loadState.total) showStart();
+        }, 400);
+      };
+    }
   }
 
   function showGameOver() {
@@ -1084,7 +1237,18 @@
     resizeTimer = setTimeout(resize, 80);
   });
   window.addEventListener('orientationchange', function () { setTimeout(resize, 200); });
-  document.addEventListener('visibilitychange', function () { last = performance.now(); });
+
+  document.addEventListener('visibilitychange', function () {
+    last = performance.now();
+    // 切回来的时候，把还没加载出来的图片再试一次（网络刚才可能抽风了）
+    if (!document.hidden && loadState.failed > 0) {
+      retryFailedImages();
+      recountImages();
+    }
+  });
+  window.addEventListener('focus', function () {
+    if (loadState.failed > 0) { retryFailedImages(); recountImages(); }
+  });
 
   // 防止手机上拖动页面
   document.addEventListener('touchmove', function (e) {
@@ -1098,11 +1262,18 @@
   // 音效按钮初始状态
   if (!Sfx.enabled) { $('btnSound').textContent = '🔇 静音'; $('btnSound').classList.add('off'); }
 
-  showStart();
+  /* 先显示"正在加载人物图片"，图下完了（或等太久）再显示开始界面。
+   * 这样一开局就是照片，不会先看到一堆水果表情。 */
+  loadDeadline = Date.now() + 20000;    // 最多等 20 秒，之后也放人进去玩
+  showLoading();
+  if (loadState.done) showStart();
+
   requestAnimationFrame(frame);
 
   // 方便你在浏览器控制台里调戏
   window.__game = game;
+  window.__images = images;
+  window.__loadState = loadState;
 })();
 </script>
 </body>
